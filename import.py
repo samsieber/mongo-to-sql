@@ -1,9 +1,17 @@
 from sqlalchemy import Table, Column, Integer, String, Boolean, MetaData, ForeignKey
 
+def fetch(obj, key):
+    try:
+        return obj['key']
+    except:
+        print "Couldn't find " + key + " in: ", obj
+        return None
+
 class TableMapping():
     def __init__(self,name,cols,source=None):
         self.name = name
         self.cols = cols
+        self.table = None
         if source is None:
             self.source = self.name
         else:
@@ -11,16 +19,22 @@ class TableMapping():
     
     def makeTable(self, metadata):
         cols = self._getCols()
-        return Table(*[self.name, self.metadata]+self._getCols())
+        self.table = Table(*[self.name, metadata]+self._getCols())
         
     def _getCols(self):
         return [col for col in self.cols.values()]
         
     def _getRow(self,obj):
-        return { col.name:obj[key] for key,col in self.cols.iteritems()}
+        try:
+            return { col.name:obj[key] for key,col in self.cols.iteritems()}
+        except Exception as e:
+            return None
         
     def getValuess(self, item):
-        return [self._getRow(item)]
+        d = self._getRow(item)
+        if d is None:
+            return []
+        return [d]
 
 class MultiMapping(TableMapping):
     def __init__(self, name, cols, multi, multi_source, source=None):
@@ -36,6 +50,8 @@ class MultiMapping(TableMapping):
         rows = [ ]
         for val in vals:
             d = TableMapping._getRow(self,obj)
+            if d is None:
+                return []
             d[self.multi.name] = val
             rows.append(d)
         return rows
@@ -45,8 +61,8 @@ class MultiMapping(TableMapping):
 
 class SchemaManager(object):
     def __init__(self, mappings=[], db="default"):
-        self.metadata = Metadata()
-        self.mappings = []
+        self.metadata = MetaData()
+        self.mappings = mappings
         self.db = db
         
     def addMapping(self,mapping):
@@ -54,28 +70,32 @@ class SchemaManager(object):
         
     def createTables(self, sqla_engine):
         for mapping in self.mappings:
-            mapping.makeTable(self,self.metadata)
+            mapping.makeTable(self.metadata)
         self.metadata.create_all(sqla_engine)
         
     def import_all(self, sqla_engine, mongo_conn):
         db = mongo_conn[self.db]
+        print "Making all tables."
         for schema in self.mappings:
-            print schema.name
             ins = schema.table.insert()
+            print "Making table for " + schema.name
             for item in db[schema.source].find().limit(100):
                 for row in schema.getValuess(item):
-                    engine.execute(ins.values(**row))
+                    sqla_engine.execute(ins.values(**row))
 
     @staticmethod
     def loadColumn(source, yaml_segment):
-        if yaml_segment.has_key('name'):
-            name = yaml_segment['name']
-            del yaml_segment['name']
-        else:
-            name = source
-        type = eval(yaml_segment['type'])
-        del yaml_segment['type']
-        return Column(name, type, **yaml_segment)
+        try:
+            if yaml_segment.has_key('name'):
+                name = yaml_segment['name']
+                del yaml_segment['name']
+            else:
+                name = source
+            type = eval(yaml_segment['type'])
+            del yaml_segment['type']
+            return Column(name, type, **yaml_segment)
+        except:
+            print source, yaml_segment
                     
     @staticmethod
     def loadFromYaml(yaml_file_name):
@@ -87,17 +107,16 @@ class SchemaManager(object):
             mappings = []
             for name,table in tables.iteritems():
                 src_table = table['source']
-                cols = [SchemaManager.loadColumn(source, content) for source,content in table['columns'].iteritems()]
-                print src_table, name, [col.name for col in cols]
+                cols = {source: SchemaManager.loadColumn(source, content) for source,content in table['columns'].iteritems()}
                 if table.has_key('linking'):
                     key = table['linking'].keys()[0]
                     value = table['linking'][key]
-                    col = loadColumn(key,value)
-                    schema = MultiMapping(name,cols,key,col,source=src_table)
-                else
+                    col = SchemaManager.loadColumn(key,value)
+                    schema = MultiMapping(name,cols,col,key,source=src_table)
+                else:
                     schema = TableMapping(name,cols,source=src_table)
-                mapping.append(schema)
-        return SchemaManager(mappings, db = db)
+                mappings.append(schema)
+            return SchemaManager(mappings = mappings, db = db)
                 
                 
 from pymongo import MongoClient
@@ -125,7 +144,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
     try:
         dbconns = DBConnections(args.mongo_host, args.mongo_port, args.mongo_db, 'postgresql:'+args.ps_uri)
-        SchemaManager.loadFromYaml(args.schema)
+        sm = SchemaManager.loadFromYaml(args.schema)
+        print sm.mappings
+        runImport(dbconns, sm)
     except ConnectionFailure as e:
         print "Internal Error", e
     
