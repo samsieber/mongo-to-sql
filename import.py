@@ -1,6 +1,7 @@
-from sqlalchemy import Table, Column, Integer, String, Boolean, MetaData, ForeignKey, ForeignKeyConstraint, PrimaryKeyConstraint
+from sqlalchemy import Table, Column, Integer, String, DateTime, MetaData, ForeignKey, ForeignKeyConstraint, PrimaryKeyConstraint, UniqueConstraint
 from sqlalchemy.exc import DataError, IntegrityError, ProgrammingError
-from sqlalchemy.dialects.postgresql import BYTEA
+from sqlalchemy import select, insert
+from sqlalchemy.dialects.postgresql import BYTEA, BOOLEAN
 import re
 import yaml, collections
 import types
@@ -25,7 +26,7 @@ def useOrdered():
     yaml.add_constructor(_mapping_tag, dict_constructor)
     
 class BaseColumn(object):
-    def __init__(self,sql=None, source=None, necessary=None):
+    def __init__(self,sql=None, source=None, necessary=None, converter = None):
         if sql == None:
             sql = source
         if source == None:
@@ -34,12 +35,18 @@ class BaseColumn(object):
         self.sql = sql
         if source[0] == "$":
             self.value = eval(source[1:])
-            def getData(self, obj):
-                return self.value
-            self.getData = types.MethodType(getData,self,BaseColumn)
+            self.getData = self.get_value
+        elif converter:
+            self.converter = converter
+            self.getData = self.get_converted
+        else:
+            self.getData = self.get_data
         self.necessary = necessary
-        
-    def getData(self, obj):
+
+    def getData(self):
+        pass # assigned in constructor
+
+    def get_data(self, obj):
         try:
             return obj[self.source]
         except KeyError as ke:
@@ -48,25 +55,44 @@ class BaseColumn(object):
                 raise ke
             else:
                 print "   For: '%s' could not read '%s'" % (obj['_id'], ke)
-                return None
 
+    def get_value(self, obj):
+        return self.value
+
+    def get_converted(self, obj):
+        return self.converter.lookup(self.get_data(obj))
 
 class LinkingColumn(BaseColumn):
-    def __init__(self,source=None, necessary=True, regex=None):
-        BaseColumn.__init__(self,source=source, necessary=necessary)
+    def __init__(self,sql=None, source=None, necessary=True, regex=None, converter = None):
+        BaseColumn.__init__(self, sql=sql, source=source, necessary=necessary)
         if regex:
             self.regex = re.compile(regex)
+            self.get_values = self.get_filtered_values
         else:
-            self.regex = None
-            
-    def getValues(self, obj):
-        values = set(BaseColumn.getData(self, obj))
-        if self.regex:
-            values = filter(self.regex.match, values)
-        return values
+            self.get_values = self.get_base_values
+        if converter:
+            self.converter = converter
+            self.getValues = self.get_converted
+        else:
+            self.getValues = self.get_values
+
+    def getValues(self,obj):
+        pass # assigned in constructor
+
+    def get_values(self,obj):
+        pass # assigned in constructor
+
+    def get_filtered(self, obj):
+        return filter(self.regex.match,self.get_base_values(obj))
+
+    def get_base_values(self, obj):
+        return set(BaseColumn.get_data(self, obj))
+
+    def get_converted(self, obj):
+        return [self.converter.lookup(value) for value in self.get_values(obj)]
 
 
-class TableSource():
+class TableSource(object):
     def __init__(self, name, cols):
         self.name = name
         self.cols = cols
@@ -76,7 +102,7 @@ class TableSource():
         try:
             return { col.sql:col.getData(obj) for col in self.cols}
         except:
-            print "Could not get values"
+            print "   ! Could not get values !"
             raise
             pass
         
@@ -87,7 +113,7 @@ class TableSource():
         return []
 
 
-class LinkingSource():
+class LinkingSource(TableSource):
     def __init__(self, name, cols, linker):
         self.name = name
         self.cols = cols
@@ -98,17 +124,37 @@ class LinkingSource():
         values = self.linker.getValues(item)
         rows = [ ]
         for value in values:
-            d = TableMapping._getRow(self,item)
+            d = TableSource._getRow(self,item)
             if d is None:
                 return []
-            d[self.linker.sql.name] = value
+            d[self.linker.sql] = value
             rows.append(d)
         return rows
+        
+class Converter():
+    def __init__(self, name, type):
+        self.name = name
+        self.type = type
+
+    def make_table(self, metadata):
+        self.table = Table(self.name, metadata, Column('id',Integer),Column('val',self.type),PrimaryKeyConstraint('id'), UniqueConstraint('val'))
+    def bind(self, engine):
+        self.engine = engine
+
+    def lookup(self, value):
+        try:
+            return self.engine.execute(select([self.table.c.id]).where(self.table.c.val==value)).first()['id']
+        except Exception as e:
+            if str(e) == "'NoneType' object has no attribute '__getitem__'":
+                return self.engine.execute(self.table.insert().values(val=value)).inserted_primary_key[0]
+            else:
+                raise
             
 class TableMapping():
     def __init__(self, dest, sources):
         self.dest = dest
         self.sources = sources
+        self.table = None
 
     @property
     def name(self):
@@ -116,7 +162,8 @@ class TableMapping():
 
     def make_table(self, metadata):
         self.table = self.dest.make_table(metadata)
-                     
+
+
 class TableDest():
     def __init__(self, name, cols,extra=[]):
         self.name = name
@@ -128,24 +175,44 @@ class TableDest():
         self.table =  Table(*args)
         return self.table
 
+
+def eval_dict(to_eval):
+    if type(to_eval) == type({'a':None}):
+        for key in to_eval:
+            to_eval[key] = eval_dict(to_eval[key])
+        return to_eval
+    if type(to_eval) == type("asdf"):
+        return attempt_eval(to_eval)
+    else:
+        return to_eval
+
+
 def attempt_eval(to_eval):
     try:
         eval(to_eval)
     except:
-        return eval
+        return to_eval
+
 
 class SchemaManager(object):
-    def __init__(self, mappings=[], db="default"):
+    def __init__(self, mappings=[], db="default", converters = {}):
         self.metadata = MetaData()
         self.mappings = []
         self.db = db
         for m in mappings:
             self.addMapping(m)
+        for k,v in converters.iteritems():
+            v.make_table(self.metadata)
+        self.converters = [v for k,v in converters.iteritems()]
         
     def addMapping(self,mapping):
         self.mappings.append(mapping)
-        print mapping, mapping.name
         mapping.make_table(self.metadata)
+
+    def init_converters(self, sqla_engine):
+        for converter in self.converters:
+            converter.bind(sqla_engine)
+            converter.table.create(sqla_engine,checkfirst=True)
     
     def dropTables(self, sqla_engine):
         for mapping in reversed(self.mappings):
@@ -153,8 +220,8 @@ class SchemaManager(object):
         
     def make_tables(self, sqla_engine):
         for mapping in self.mappings:
-            print CreateTable(mapping.table).compile(sqla_engine)
             mapping.table.create(sqla_engine,checkfirst=True)
+
         
     def wipeTables(self, sqla_engine):
         self.dropTables(sqla_engine)
@@ -175,6 +242,7 @@ class SchemaManager(object):
             count = 0
             row_num = 0
             error_count = 0
+
             for item in db[source.name].find(source.filter).limit(limit):
                 row_num+= 1
                 for row in source.getValues(item):
@@ -187,6 +255,7 @@ class SchemaManager(object):
                     except IntegrityError as i:
                         print "   Could not import for %s :" % item['_id'], "integrity_error"
                         #print i
+                        #raise
                         error_count += 1
                     except ProgrammingError as p:
                         print "   Could not import for %s :" % item['_id'], "programming_error"
@@ -195,13 +264,19 @@ class SchemaManager(object):
                     except Exception as e:
                         print "   Other unknown error.", e
                         error_count += 1
-            print "  Loaded %s items" % (count)
-            print "  Could not load %s items" % error_count
-            print "  Processed %s items" % (row_num)
+                    if row_num % 200 == 0:
+                        print  "   progress: %s items imported " % (row_num)
+            print "  %s items added" % (count)
+            print "  %s items NOT added" % error_count
+            print "  %s rows process" % (row_num)
 
-class Importer():
-    @staticmethod
-    def sql_col(sql):
+
+class Import():
+    def __init__(self, yaml_file_name):
+        self.converters = {}
+        self.value = self.load_from_yaml(yaml_file_name)
+    
+    def sql_col(self,sql):
         name = sql['name']
         del sql['name']
         type = eval(sql['type'])
@@ -216,43 +291,52 @@ class Importer():
         values = [name,type] + extra
         
         return Column(*values)
-        
                 
-    @staticmethod
-    def mongo_col(mongo, clazz=BaseColumn):
+    def mongo_col(self,mongo, clazz=BaseColumn):
+        mongo = {k:v for k,v in mongo.iteritems()}
+        if 'converter' in mongo:
+            print ">>>>>>>>>>>%s<<<<<<<<<<" % (mongo['converter'])
+            mongo['converter'] = self.converters[mongo['converter']]
         return clazz(**mongo)
     
-    @staticmethod
-    def loadFromYaml(yaml_file_name, ignore_refresh=False):
+    def load_from_yaml(self,yaml_file_name):
         with open(yaml_file_name, 'r') as f:
             doc = yaml.load(f, )
             db = doc['db']
             tables = doc['tables']
             mappings = []
+            if "converters" in doc:
+                self.converters = { name: Converter(name, eval(type)) for name,type in doc['converters'].iteritems() }
             for name,table in tables.iteritems():
                 sql = table['sql']
                 if sql.has_key('extra'):
                     extra = [eval(ext) for ext in sql['extra']]
                 else:
                     extra = []
-                dest = TableDest(sql['name'],[Importer.sql_col(col) for col in sql['columns']], extra=extra)
+                dest = TableDest(sql['name'],[self.sql_col(col) for col in sql['columns']], extra=extra)
 
 
                 mongos = table['mongo']
                 sources = []
                 for item in mongos:
                     name = item['name']
-                    cols = [Importer.mongo_col(col) for col in item['columns']]
-                    if item.has_key("linker"):
-                        mongo_table = LinkingSource(name, cols, Importer.mongo_col(item['linker']))
+                    cols = [self.mongo_col(col) for col in item['columns']]
+                    if item.has_key("linking"):
+                        mongo_table = LinkingSource(name, cols, self.mongo_col(item['linking'],clazz=LinkingColumn))
                     else:
                         mongo_table = TableSource(name, cols)
                     if item.has_key("filter"):
                         mongo_table.filter = item['filter']
+                        for key in mongo_table.filter:
+                            try: 
+                                mongo_table.filter[key]['$not'] = re.compile(mongo_table.filter[key]['$not'])
+                            except:
+                                pass
+                        mongo_table.filter = eval_dict(mongo_table.filter)
                     sources.append(mongo_table)
                 
                 mappings.append(TableMapping(dest, sources))
-            return SchemaManager(mappings = mappings, db = db)
+            return SchemaManager(converters = self.converters, mappings = mappings, db = db)
                 
 from pymongo import MongoClient
 from sqlalchemy import create_engine
@@ -268,9 +352,24 @@ def runImport(connections, scheme_manager, tables = [], limit=1000):
         mappings = [mapping for mapping in scheme_manager.mappings if mapping.name in tables]
         scheme_manager.mappings = mappings
         print tables, mappings
+    scheme_manager.init_converters(connections.engine)
     scheme_manager.wipeTables(connections.engine)
     scheme_manager.import_all(connections.engine, connections.conn, limit = limit)
-    
+
+import sys
+
+class Tee(object):
+    def __init__(self, *files):
+        self.files = files
+    def write(self, obj):
+        for f in self.files:
+            f.write(obj)
+
+def use_std_file(fout):
+    f = open(fout, 'w')
+    original = sys.stdout
+    sys.stdout = Tee(sys.stdout, f)
+    return f
     
 if __name__ == "__main__":
     from pymongo.errors import ConnectionFailure
@@ -284,15 +383,24 @@ if __name__ == "__main__":
     parser.add_argument("--schema", help="the location of the python file to use", type=str, default="scheme.yaml")
     parser.add_argument("--tables", help="which tables to process", type=str, default="")
     parser.add_argument("--limit", help="what to limit each table to", type=int, default=20000)
+    parser.add_argument("--output", help="where to dump the log", type=str, default="")
     args = parser.parse_args()
     try:
+        if args.output:
+            f = use_std_file(args.output)
+        else:
+            f = None
         dbconns = DBConnections(args.mongo_host, args.mongo_port, args.mongo_db, 'postgresql:'+args.ps_uri)
         useOrdered()
-        sm = Importer.loadFromYaml(args.schema,False)
+        sm = Import(args.schema).value
         if args.tables:
             tables = args.tables.split(",")
         else:
             tables =[]
         runImport(dbconns, sm, tables=tables, limit=args.limit)
+        try:
+            f.close()
+        except:
+            pass
     except ConnectionFailure as e:
         print "Internal Error", e
