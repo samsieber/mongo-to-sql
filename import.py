@@ -105,6 +105,10 @@ class TableSource(object):
             print "   ! Could not get values !"
             raise
             pass
+
+    @property
+    def restricter(self):
+        return {col.source:1 for col in self.cols}
         
     def getValues(self, obj):
         r = self._getRow(obj)
@@ -119,7 +123,11 @@ class LinkingSource(TableSource):
         self.cols = cols
         self.linker = linker
         self.filter = {}
-        
+
+    @property
+    def restricter(self):
+        return {col.source:1 for col in self.cols+[self.linker]}
+
     def getValues(self,item):
         values = self.linker.getValues(item)
         rows = [ ]
@@ -243,7 +251,7 @@ class SchemaManager(object):
             row_num = 0
             error_count = 0
 
-            for item in db[source.name].find(source.filter).limit(limit):
+            for item in db[source.name].find(source.filter, source.restricter).limit(limit):
                 row_num+= 1
                 for row in source.getValues(item):
                     try:
