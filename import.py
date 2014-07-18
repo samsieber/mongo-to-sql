@@ -253,27 +253,32 @@ class SchemaManager(object):
 
             for item in db[source.name].find(source.filter, source.restricter).limit(limit):
                 row_num+= 1
-                for row in source.getValues(item):
-                    try:
-                        sql_engine.execute(ins.values(**row))
-                        count +=1
-                    except DataError:
-                        print "   Could not import for %s :" % item['_id'], "data_error"
-                        error_count += 1
-                    except IntegrityError as i:
-                        print "   Could not import for %s :" % item['_id'], "integrity_error"
-                        #print i
-                        #raise
-                        error_count += 1
-                    except ProgrammingError as p:
+                try:
+                    for row in source.getValues(item):
+                        try:
+                            sql_engine.execute(ins.values(**row))
+                            count +=1
+                        except DataError:
+                            print "   Could not import for %s :" % item['_id'], "data_error"
+                            error_count += 1
+                        except IntegrityError as i:
+                            print "   Could not import for %s :" % item['_id'], "integrity_error"
+                            #print i
+                            #raise
+                            error_count += 1
+                        except ProgrammingError as p:
+                            print "   Could not import for %s :" % item['_id'], "programming_error"
+                            #print p
+                            error_count += 1
+                        except Exception as e:
+                            print "   Other unknown error.", e
+                            error_count += 1
+                        if row_num % 200 == 0:
+                            print  "   progress: %s items imported " % (row_num)
+                except ProgrammingError as p:
                         print "   Could not import for %s :" % item['_id'], "programming_error"
                         #print p
                         error_count += 1
-                    except Exception as e:
-                        print "   Other unknown error.", e
-                        error_count += 1
-                    if row_num % 200 == 0:
-                        print  "   progress: %s items imported " % (row_num)
             print "  %s items added" % (count)
             print "  %s items NOT added" % error_count
             print "  %s rows process" % (row_num)
@@ -303,7 +308,6 @@ class Import():
     def mongo_col(self,mongo, clazz=BaseColumn):
         mongo = {k:v for k,v in mongo.iteritems()}
         if 'converter' in mongo:
-            print ">>>>>>>>>>>%s<<<<<<<<<<" % (mongo['converter'])
             mongo['converter'] = self.converters[mongo['converter']]
         return clazz(**mongo)
     
@@ -355,14 +359,18 @@ class DBConnections():
         self.engine = create_engine(sql_uri)
 
 
-def runImport(connections, scheme_manager, tables = [], limit=1000):
+def runImport(connections, scheme_manager, tables = [], start="", limit=1000):
     if tables:
         mappings = [mapping for mapping in scheme_manager.mappings if mapping.name in tables]
         scheme_manager.mappings = mappings
-        print tables, mappings
+    elif start:
+        from itertools import dropwhile
+        mappings = [m for m in dropwhile(lambda x:x.dest.name != start, scheme_manager.mappings)]
+        scheme_manager.mappings = mappings
     scheme_manager.init_converters(connections.engine)
     scheme_manager.wipeTables(connections.engine)
     scheme_manager.import_all(connections.engine, connections.conn, limit = limit)
+
 
 import sys
 
@@ -392,6 +400,7 @@ if __name__ == "__main__":
     parser.add_argument("--tables", help="which tables to process", type=str, default="")
     parser.add_argument("--limit", help="what to limit each table to", type=int, default=20000)
     parser.add_argument("--output", help="where to dump the log", type=str, default="")
+    parser.add_argument("--start", help="where to start in the importing", type=str, default="")
     args = parser.parse_args()
     try:
         if args.output:
@@ -405,7 +414,7 @@ if __name__ == "__main__":
             tables = args.tables.split(",")
         else:
             tables =[]
-        runImport(dbconns, sm, tables=tables, limit=args.limit)
+        runImport(dbconns, sm, tables=tables, start=args.start, limit=args.limit)
         try:
             f.close()
         except:
